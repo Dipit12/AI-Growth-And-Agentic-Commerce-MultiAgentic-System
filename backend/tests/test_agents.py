@@ -10,7 +10,7 @@ import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from app.agents.cart_manager import add_item, cart_manager_node, compute_total, remove_item
+from app.agents.cart_manager import _extract_sku_like_tokens, add_item, cart_manager_node, compute_total, remove_item
 from app.agents.checkout import checkout_node
 from app.agents.discovery import discovery_node
 from app.agents.graph import chat_graph
@@ -230,6 +230,40 @@ def test_compute_total_has_no_floating_point_error() -> None:
     assert isinstance(compute_total(cart), int)
 
 
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("add ELEC-002 to my cart", ["ELEC-002"]),
+        ("add elec-002 please", ["ELEC-002"]),
+        ("I want the FIT-010 and HOM-005", ["FIT-010", "HOM-005"]),
+        ("what's in my cart?", []),
+    ],
+)
+def test_extract_sku_like_tokens(text: str, expected: list[str]) -> None:
+    assert _extract_sku_like_tokens(text) == expected
+
+
+@pytest.mark.asyncio
+async def test_cart_manager_node_offers_a_directly_mentioned_sku_as_a_candidate(session_factory, fake_redis) -> None:  # type: ignore[no-untyped-def]
+    """A SKU mentioned directly (no prior discovery step) must still be resolvable — regression for
+    a real failure seen with a small local model that returned sku=null when the prompt's candidate
+    list was empty, even though the user had typed the SKU verbatim."""
+    session_store = SessionStore(redis=fake_redis)
+    seen_candidates = {}
+
+    async def fake_llm(prompt: str) -> str:
+        seen_candidates["prompt"] = prompt
+        return '{"operation": "add", "sku": "ELEC-002", "qty": 1}'
+
+    state = _state(messages=[{"role": "user", "content": "add ELEC-002 to my cart, quantity 1"}])
+    result = await cart_manager_node(
+        state, session_factory=session_factory, session_store=session_store, llm_call=fake_llm,
+    )
+
+    assert "ELEC-002" in seen_candidates["prompt"]
+    assert compute_total(result["cart"]) == 129900
+
+
 @pytest.mark.asyncio
 async def test_cart_manager_node_add_survives_session_roundtrip(session_factory, fake_redis) -> None:  # type: ignore[no-untyped-def]
     session_store = SessionStore(redis=fake_redis)
@@ -325,6 +359,50 @@ def test_every_intent_maps_to_a_reachable_node() -> None:
     graph_nodes = set(chat_graph.get_graph().nodes.keys())
     for intent, node_name in _INTENT_TO_NODE.items():
         assert node_name in graph_nodes, f"intent '{intent}' routes to unreachable node '{node_name}'"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "intent,expected_marker",
+    [
+        ("discover", "discovery-reached"),
+        ("recommend", "recommender-reached"),
+        ("cart", "cart_manager-reached"),
+        ("checkout", "checkout-reached"),
+        ("support", "support-reached"),
+    ],
+)
+async def test_graph_actually_routes_every_intent_without_langgraph_error(monkeypatch, intent: str, expected_marker: str) -> None:  # type: ignore[no-untyped-def]
+    """End-to-end regression test: add_conditional_edges' path_map was once set to _INTENT_TO_NODE
+    even though _route_from_router already returns node names, not intents. LangGraph then tried to
+    look up the *node name* as a key in that dict, which only happens to exist for "checkout" and
+    "support" (where node name == intent name) — "cart" -> "cart_manager" and friends raised
+    KeyError at runtime. Neither test_route_from_router_maps_every_intent (tests the pure function
+    in isolation) nor test_every_intent_maps_to_a_reachable_node (checks node existence, not
+    reachability via the actual conditional edge) would catch that — this drives a real
+    `ainvoke()` through the compiled graph for every intent instead.
+    """
+    import app.agents.graph as graph_module
+
+    async def fake_router(state: dict, **kwargs: object) -> dict:
+        return {"current_intent": intent}
+
+    def make_stub(marker: str):  # type: ignore[no-untyped-def]
+        async def stub(state: dict, **kwargs: object) -> dict:
+            return {"final_response": marker}
+
+        return stub
+
+    monkeypatch.setattr(graph_module, "router_node", fake_router)
+    monkeypatch.setattr(graph_module, "discovery_node", make_stub("discovery-reached"))
+    monkeypatch.setattr(graph_module, "recommender_node", make_stub("recommender-reached"))
+    monkeypatch.setattr(graph_module, "cart_manager_node", make_stub("cart_manager-reached"))
+    monkeypatch.setattr(graph_module, "checkout_node", make_stub("checkout-reached"))
+    monkeypatch.setattr(graph_module, "support_node", make_stub("support-reached"))
+
+    fresh_graph = graph_module.build_graph()
+    result = await fresh_graph.ainvoke(_state())
+    assert result["final_response"] == expected_marker
 
 
 # ---------------------------------------------------------------------------

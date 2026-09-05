@@ -42,7 +42,13 @@ def build_graph() -> object:
     graph.add_node("support", support_node)
 
     graph.set_entry_point("router")
-    graph.add_conditional_edges("router", _route_from_router, _INTENT_TO_NODE)
+    # No path_map here: _route_from_router already returns the target node name directly (not an
+    # intent that would need a further lookup) — passing _INTENT_TO_NODE as path_map here was a
+    # real bug (LangGraph would then treat the *node name* as a key into it, which only happens to
+    # exist for "checkout" and "support", where node name == intent name; "cart" -> "cart_manager"
+    # and friends raised KeyError at runtime, never covered by tests that mocked router or checked
+    # its pieces in isolation instead of an end-to-end graph invocation for those intents).
+    graph.add_conditional_edges("router", _route_from_router)
 
     for node_name in _INTENT_TO_NODE.values():
         graph.add_edge(node_name, END)

@@ -1,17 +1,15 @@
-"""Shared singletons for the API layer. Layer 1 (surfaces). The audit logger's background drain
-task is started/stopped from main.py's lifespan, since it needs a running event loop.
+"""Shared singletons for the API layer. Layer 1 (surfaces). The audit logger is the same
+process-wide singleton app/agents/*.py nodes default to (app/audit/singleton.py) — re-exported here
+so existing `from app.api.deps import get_audit_logger` call sites keep working unchanged. Its
+background drain task is started/stopped from main.py's lifespan, since it needs a running event loop.
 """
 
-from app.audit.logger import AuditLogger
-from app.db.session import async_session_factory
+from app.audit.singleton import audit_logger, get_audit_logger
 from app.integrations.session_store import SessionStore
 
-audit_logger = AuditLogger(async_session_factory)
 session_store = SessionStore()
 
-
-def get_audit_logger() -> AuditLogger:
-    return audit_logger
+__all__ = ["audit_logger", "get_audit_logger", "session_store", "get_session_store"]
 
 
 def get_session_store() -> SessionStore:

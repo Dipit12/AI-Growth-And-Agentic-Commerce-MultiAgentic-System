@@ -11,15 +11,13 @@ registers each one onto the MCPServer instance.
 import uuid
 from typing import Any
 
-from sqlalchemy import select
-
 from app.agents.cart_manager import add_item, compute_total, remove_item
 from app.agents.checkout import checkout_node
 from app.agents.state import AgentState, Cart, empty_cart
 from app.api.deps import get_audit_logger, get_session_store
 from app.db.session import async_session_factory
 from app.integrations.vector_store import VectorStore
-from app.models.product import Product
+from app.models.product import Product, get_product_by_sku
 
 
 def _product_dict(product: Product) -> dict[str, Any]:
@@ -45,18 +43,17 @@ async def search_catalog(query: str, category: str | None = None, limit: int = 5
     validated: list[dict[str, Any]] = []
     async with async_session_factory() as session:
         for hit in raw_results:
-            result = await session.execute(select(Product).where(Product.sku == hit.get("sku")))
-            product = result.scalar_one_or_none()
+            sku = hit.get("sku")
+            product = await get_product_by_sku(session, sku) if sku else None
             if product is not None and product.stock > 0:
                 validated.append(_product_dict(product))
     return validated
 
 
 async def get_product(sku: str) -> dict[str, Any] | None:
-    """Look up a single product by its exact SKU. Returns null if the SKU doesn't exist."""
+    """Look up a single product by SKU (case-insensitive). Returns null if the SKU doesn't exist."""
     async with async_session_factory() as session:
-        result = await session.execute(select(Product).where(Product.sku == sku))
-        product = result.scalar_one_or_none()
+        product = await get_product_by_sku(session, sku)
     return _product_dict(product) if product is not None else None
 
 
@@ -78,8 +75,7 @@ async def add_to_cart(cart_id: str, sku: str, qty: int = 1) -> dict[str, Any]:
     cart = _cart_from_raw(await session_store.get_cart(cart_id))
 
     async with async_session_factory() as session:
-        result = await session.execute(select(Product).where(Product.sku == sku))
-        product = result.scalar_one_or_none()
+        product = await get_product_by_sku(session, sku)
 
     if product is None or product.stock <= 0:
         raise ValueError(f"SKU '{sku}' does not exist or is out of stock.")

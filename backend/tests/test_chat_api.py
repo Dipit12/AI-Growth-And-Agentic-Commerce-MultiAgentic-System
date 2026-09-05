@@ -86,16 +86,58 @@ async def test_chat_preserves_session_id_and_cart_across_turns(app_client: Async
 
 
 @pytest.mark.asyncio
-async def test_chat_returns_pending_approval_id_when_gate_is_slow(app_client: AsyncClient, fake_redis_session_store, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+async def test_chat_keeps_waiting_when_slow_but_not_actually_gated(app_client: AsyncClient, fake_redis_session_store, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """A slow turn (e.g. a small local LLM) that never created a PendingApproval row must NOT be
+    reported as 'waiting for merchant confirmation' — that message is only true when a checkout was
+    genuinely gated. The endpoint should just keep waiting and return the real result."""
     import app.api.chat as chat_module
 
     monkeypatch.setattr(chat_module, "GATE_RACE_TIMEOUT_SECONDS", 0.2)
-    monkeypatch.setattr(chat_module, "chat_graph", FakeGraph(delay=1.0))
+    monkeypatch.setattr(chat_module, "MAX_TOTAL_WAIT_SECONDS", 2.0)
+    monkeypatch.setattr(
+        chat_module, "chat_graph", FakeGraph({"final_response": "Slow but real answer.", "cart": empty_cart()}, delay=0.5)
+    )
+
+    response = await app_client.post("/chat", json={"message": "hello"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["response"] == "Slow but real answer."
+    assert body["pending_approval_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_chat_returns_pending_approval_id_when_genuinely_gated(app_client: AsyncClient, fake_redis_session_store, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """When a PendingApproval row actually exists for the trace_id, the endpoint must return
+    promptly with that approval id rather than waiting out the full graph run."""
+    import uuid
+
+    import app.api.chat as chat_module
+    from app.db.session import async_session_factory
+    from app.models.pending_approval import ApprovalStatus, PendingApproval
+
+    monkeypatch.setattr(chat_module, "GATE_RACE_TIMEOUT_SECONDS", 0.2)
+
+    class GatedGraph:
+        async def ainvoke(self, state: dict) -> dict:
+            # _start_turn always generates a fresh UUID4 session_id when the client sends none.
+            async with async_session_factory() as session:
+                session.add(
+                    PendingApproval(
+                        trace_id=uuid.UUID(state["trace_id"]),
+                        session_id=uuid.UUID(state["session_id"]),
+                        action_type="create_order",
+                        payload={},
+                        status=ApprovalStatus.PENDING.value,
+                    )
+                )
+                await session.commit()
+            await asyncio.sleep(30)  # never resolves within the test
+            return {"final_response": "should never get here", "cart": empty_cart()}
+
+    monkeypatch.setattr(chat_module, "chat_graph", GatedGraph())
 
     response = await app_client.post("/chat", json={"message": "buy the very expensive thing"})
     assert response.status_code == 200
     body = response.json()
     assert "waiting for merchant confirmation" in body["response"].lower()
-    # No PendingApproval row exists for this trace_id (the fake graph never created one), so the
-    # lookup correctly comes back empty rather than guessing at an id.
-    assert body["pending_approval_id"] is None
+    assert body["pending_approval_id"] is not None

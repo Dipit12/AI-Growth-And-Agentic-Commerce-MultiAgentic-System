@@ -10,6 +10,7 @@ from app.agents.prompts.loader import load_prompt
 from app.agents.state import AgentState
 from app.audit.logger import AuditLogger
 from app.audit.models import Actor
+from app.audit.singleton import get_audit_logger
 from app.integrations.vector_store import VectorStore
 from app.utils.ids import to_uuid
 
@@ -38,6 +39,7 @@ async def recommender_node(
     top_n: int = TOP_N,
 ) -> dict[str, object]:
     vector_store = vector_store or VectorStore()
+    audit = audit or get_audit_logger()
     llm_call = llm_call or default_llm_call
 
     cart = state["cart"]

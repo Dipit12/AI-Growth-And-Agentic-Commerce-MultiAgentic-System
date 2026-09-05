@@ -7,6 +7,7 @@ from app.agents.prompts.loader import load_prompt
 from app.agents.state import AgentState, Intent
 from app.audit.logger import AuditLogger
 from app.audit.models import Actor
+from app.audit.singleton import get_audit_logger
 from app.utils.ids import to_uuid
 
 VALID_INTENTS: set[Intent] = {"discover", "recommend", "cart", "checkout", "support"}
@@ -28,6 +29,7 @@ async def router_node(
     audit: AuditLogger | None = None,
     llm_call: LLMCallFn | None = None,
 ) -> dict[str, Intent]:
+    audit = audit or get_audit_logger()
     llm_call = llm_call or default_llm_call
 
     prompt = load_prompt("router").format(conversation=format_conversation(state["messages"]))

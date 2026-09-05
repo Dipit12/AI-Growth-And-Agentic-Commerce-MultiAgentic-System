@@ -22,6 +22,12 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: str = ""
     VOYAGE_API_KEY: str = ""
 
+    # Local-model fallback per CLAUDE.md's tech stack ("local Llama via Ollama as fallback for
+    # cost-sensitive nodes"). When ANTHROPIC_API_KEY is unset, app/agents/llm.py uses Ollama instead
+    # of failing outright — set OLLAMA_MODEL to whatever's pulled locally (e.g. "deepseek-r1:1.5b").
+    OLLAMA_MODEL: str = ""
+    OLLAMA_BASE_URL: str = "http://localhost:11434"
+
     POSTGRES_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/razorpay_buildathon"
     REDIS_URL: str = "redis://localhost:6379/0"
     QDRANT_URL: str = "http://localhost:6333"

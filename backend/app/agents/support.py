@@ -7,6 +7,7 @@ from app.agents.prompts.loader import load_prompt
 from app.agents.state import AgentState
 from app.audit.logger import AuditLogger
 from app.audit.models import Actor
+from app.audit.singleton import get_audit_logger
 from app.utils.ids import to_uuid
 
 
@@ -16,6 +17,7 @@ async def support_node(
     audit: AuditLogger | None = None,
     llm_call: LLMCallFn | None = None,
 ) -> dict[str, object]:
+    audit = audit or get_audit_logger()
     llm_call = llm_call or default_llm_call
 
     prompt = load_prompt("support").format(conversation=format_conversation(state["messages"]))

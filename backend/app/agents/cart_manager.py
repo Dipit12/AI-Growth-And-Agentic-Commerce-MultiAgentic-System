@@ -3,17 +3,19 @@ translates the user's message into a structured operation (invariant #7: it neve
 arithmetic). Cannot call Razorpay.
 """
 
-from sqlalchemy import select
+import re
+
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.agents.llm import LLMCallFn, default_llm_call, format_conversation
+from app.agents.llm import LLMCallFn, default_llm_call, format_conversation, last_user_message
 from app.agents.prompts.loader import load_prompt
 from app.agents.state import Cart, CartItem, AgentState
 from app.audit.logger import AuditLogger
 from app.audit.models import Actor
+from app.audit.singleton import get_audit_logger
 from app.db.session import async_session_factory
 from app.integrations.session_store import SessionStore
-from app.models.product import Product
+from app.models.product import get_product_by_sku
 from app.utils.ids import to_uuid
 from app.utils.llm_json import extract_json
 
@@ -47,6 +49,16 @@ def compute_total(cart: Cart) -> int:
     return sum(item["qty"] * item["unit_price_paise"] for item in cart["items"])
 
 
+_SKU_TOKEN_RE = re.compile(r"\b[A-Za-z]{2,}-\d{2,}\b")
+
+
+def _extract_sku_like_tokens(text: str) -> list[str]:
+    """Catches a SKU the user typed directly (e.g. "add ELEC-002") so it's offered to the LLM as a
+    candidate even when there was no prior discovery step — smaller/weaker models are much more
+    reliable at *picking* an offered SKU than at inventing the right one from a bare mention."""
+    return [match.group(0).upper() for match in _SKU_TOKEN_RE.finditer(text)]
+
+
 async def cart_manager_node(
     state: AgentState,
     *,
@@ -57,11 +69,13 @@ async def cart_manager_node(
 ) -> dict[str, object]:
     session_factory = session_factory or async_session_factory
     session_store = session_store or SessionStore()
+    audit = audit or get_audit_logger()
     llm_call = llm_call or default_llm_call
 
     cart = state["cart"]
     candidate_skus = [r["sku"] for r in state.get("discovery_results", []) if "sku" in r]
     candidate_skus += [item["sku"] for item in cart["items"]]
+    candidate_skus += _extract_sku_like_tokens(last_user_message(state["messages"]))
 
     prompt = load_prompt("cart_manager").format(
         candidate_skus=", ".join(candidate_skus) or "(none)",
@@ -83,8 +97,7 @@ async def cart_manager_node(
 
     if operation == "add" and sku:
         async with session_factory() as session:
-            result = await session.execute(select(Product).where(Product.sku == sku))
-            product = result.scalar_one_or_none()
+            product = await get_product_by_sku(session, sku)
         if product is not None and product.stock > 0:
             new_cart = add_item(
                 cart, product.sku, product.name, product.price_paise, product.category, qty=qty

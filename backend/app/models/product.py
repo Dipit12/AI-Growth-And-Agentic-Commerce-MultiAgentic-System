@@ -5,8 +5,9 @@ from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import JSON, Integer, String, Text, Uuid
+from sqlalchemy import JSON, Integer, String, Text, Uuid, select
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
 
@@ -38,6 +39,13 @@ class Product(Base):
     updated_at: Mapped[datetime] = mapped_column(
         server_default=func.now(), onupdate=func.now(), nullable=False
     )
+
+
+async def get_product_by_sku(session: AsyncSession, sku: str) -> "Product | None":
+    """Case-insensitive SKU lookup shared by every node/tool that resolves a product — LLMs
+    (especially smaller local models) don't reliably reproduce a catalog SKU's exact casing."""
+    result = await session.execute(select(Product).where(func.upper(Product.sku) == sku.strip().upper()))
+    return result.scalar_one_or_none()
 
 
 class ProductCreate(BaseModel):

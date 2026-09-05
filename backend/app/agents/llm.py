@@ -1,12 +1,15 @@
-"""Thin wrapper around the Claude chat model shared by agent nodes. Layer 2 (agents).
+"""Thin wrapper around the chat model shared by agent nodes. Layer 2 (agents).
 
 Every node takes an injectable `llm_call` callable so tests can supply a fake without hitting the
 network or needing an API key; production code falls through to `default_llm_call`, which calls
-Claude Haiku via langchain-anthropic.
+Claude Haiku via langchain-anthropic when ANTHROPIC_API_KEY is set, otherwise falls back to a local
+Ollama model (OLLAMA_MODEL) per CLAUDE.md's tech stack ("local Llama via Ollama as fallback for
+cost-sensitive nodes").
 """
 
 from collections.abc import Awaitable, Callable
 
+import httpx
 from langchain_anthropic import ChatAnthropic
 
 from app.agents.state import ChatMessage
@@ -15,6 +18,8 @@ from app.config import get_settings
 LLMCallFn = Callable[[str], Awaitable[str]]
 
 _model_cache: ChatAnthropic | None = None
+
+OLLAMA_TIMEOUT_SECONDS = 120.0
 
 
 def _get_model() -> ChatAnthropic:
@@ -32,7 +37,7 @@ def _get_model() -> ChatAnthropic:
     return _model_cache
 
 
-async def default_llm_call(prompt: str) -> str:
+async def _anthropic_llm_call(prompt: str) -> str:
     model = _get_model()
     response = await model.ainvoke(prompt)
     content = response.content
@@ -41,6 +46,31 @@ async def default_llm_call(prompt: str) -> str:
             part.get("text", "") if isinstance(part, dict) else str(part) for part in content
         )
     return str(content)
+
+
+async def _ollama_llm_call(prompt: str) -> str:
+    settings = get_settings()
+    async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT_SECONDS) as client:
+        response = await client.post(
+            f"{settings.OLLAMA_BASE_URL}/api/generate",
+            json={"model": settings.OLLAMA_MODEL, "prompt": prompt, "stream": False},
+        )
+        response.raise_for_status()
+        # Ollama's "thinking"-capable models (e.g. deepseek-r1) already separate chain-of-thought
+        # into its own "thinking" field — "response" is the clean final text, no tag-stripping needed.
+        text: str = response.json()["response"]
+        return text.strip()
+
+
+async def default_llm_call(prompt: str) -> str:
+    settings = get_settings()
+    if settings.ANTHROPIC_API_KEY:
+        return await _anthropic_llm_call(prompt)
+    if settings.OLLAMA_MODEL:
+        return await _ollama_llm_call(prompt)
+    raise RuntimeError(
+        "No LLM configured: set ANTHROPIC_API_KEY or OLLAMA_MODEL in the environment/.env."
+    )
 
 
 def format_conversation(messages: list[ChatMessage], limit: int = 10) -> str:

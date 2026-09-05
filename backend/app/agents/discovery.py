@@ -4,7 +4,6 @@ cannot call Razorpay and cannot modify the cart (invariant #1 boundary).
 
 import json
 
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.agents.llm import LLMCallFn, default_llm_call, format_conversation, last_user_message
@@ -12,9 +11,10 @@ from app.agents.prompts.loader import load_prompt
 from app.agents.state import AgentState
 from app.audit.logger import AuditLogger
 from app.audit.models import Actor
+from app.audit.singleton import get_audit_logger
 from app.db.session import async_session_factory
 from app.integrations.vector_store import VectorStore
-from app.models.product import Product
+from app.models.product import get_product_by_sku
 from app.utils.ids import to_uuid
 from app.utils.llm_json import extract_json
 
@@ -30,6 +30,7 @@ async def discovery_node(
 ) -> dict[str, object]:
     vector_store = vector_store or VectorStore()
     session_factory = session_factory or async_session_factory
+    audit = audit or get_audit_logger()
     llm_call = llm_call or default_llm_call
 
     query = last_user_message(state["messages"])
@@ -55,8 +56,7 @@ async def discovery_node(
 
     async with session_factory() as session:
         for sku in proposed_skus:
-            result = await session.execute(select(Product).where(Product.sku == sku))
-            product = result.scalar_one_or_none()
+            product = await get_product_by_sku(session, sku)
             if product is None or product.stock <= 0:
                 removed.append(sku)
                 continue

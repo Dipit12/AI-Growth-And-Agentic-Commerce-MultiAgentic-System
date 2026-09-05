@@ -3,10 +3,12 @@ client sends `Accept: text/event-stream`, otherwise returns a single JSON respon
 
 A gated checkout can wait on merchant approval for up to five minutes (see
 guardrails/confirmation.py). Blocking the HTTP request that long would be poor UX, so this endpoint
-races the graph invocation against a short timeout: if it doesn't finish quickly, the graph keeps
-running in the background (the confirmation gate's PendingApproval row already exists — it was
-written synchronously before the wait began) and the response tells the caller which
-`pending_approval_id` to watch, e.g. via the merchant console WebSocket or a follow-up chat turn.
+races the graph invocation against a short timeout; if that fires, it checks whether a
+PendingApproval row actually exists before deciding what happened — if so, the checkout is
+genuinely gated and the graph keeps running in the background while the response tells the caller
+which `pending_approval_id` to watch (merchant console WebSocket, or a follow-up chat turn). If not,
+the short timeout just caught an unusually slow turn (e.g. a small local LLM), and this keeps
+waiting for the real result rather than fabricating a "waiting for approval" message.
 """
 
 import asyncio
@@ -30,6 +32,9 @@ logger = get_logger("chat_api")
 router = APIRouter(tags=["chat"])
 
 GATE_RACE_TIMEOUT_SECONDS = 3.0
+# Safety net for slow-but-not-gated turns (e.g. a small local Ollama model taking several seconds
+# per LLM call) — comfortably under confirmation.py's own 300s approval wait.
+MAX_TOTAL_WAIT_SECONDS = 240.0
 
 
 class ChatRequest(BaseModel):
@@ -85,6 +90,31 @@ async def _start_turn(payload: ChatRequest) -> tuple[str, uuid.UUID, AgentState,
     return session_id, trace_id, state, task
 
 
+async def _await_graph_result(
+    task: "asyncio.Task[AgentState]", trace_id: uuid.UUID
+) -> tuple[AgentState | None, uuid.UUID | None]:
+    """Races the graph invocation against a short timeout. If it doesn't finish in time, checks
+    whether a PendingApproval row actually exists for this trace_id: if so, the checkout is
+    genuinely gated and control returns to the caller immediately (the task keeps running in the
+    background). If not, the slowness is just an unusually slow node — e.g. a small local Ollama
+    model taking several seconds per call — and this keeps waiting for the real result instead of
+    fabricating a "waiting for merchant approval" message for a turn that was never gated at all.
+
+    Returns (result, None) on completion, or (None, pending_approval_id) if genuinely gated.
+    """
+    try:
+        result = await asyncio.wait_for(asyncio.shield(task), timeout=GATE_RACE_TIMEOUT_SECONDS)
+        return result, None
+    except asyncio.TimeoutError:
+        pending_id = await _find_latest_pending_approval(trace_id)
+        if pending_id is not None:
+            return None, pending_id
+
+    remaining = MAX_TOTAL_WAIT_SECONDS - GATE_RACE_TIMEOUT_SECONDS
+    result = await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
+    return result, None
+
+
 @router.post("/chat")
 async def chat(payload: ChatRequest, request: Request) -> Response:
     if request.headers.get("accept") == "text/event-stream":
@@ -96,10 +126,9 @@ async def _chat_json(payload: ChatRequest) -> JSONResponse:
     session_id, trace_id, state, task = await _start_turn(payload)
     session_store = get_session_store()
 
-    try:
-        result = await asyncio.wait_for(asyncio.shield(task), timeout=GATE_RACE_TIMEOUT_SECONDS)
-    except asyncio.TimeoutError:
-        pending_id = await _find_latest_pending_approval(trace_id)
+    result, pending_id = await _await_graph_result(task, trace_id)
+
+    if result is None:
         logger.info("chat.gated_pending_approval", trace_id=str(trace_id), pending_approval_id=str(pending_id))
         response = ChatResponse(
             session_id=session_id,
@@ -109,7 +138,7 @@ async def _chat_json(payload: ChatRequest) -> JSONResponse:
                 "You'll be notified once it's resolved."
             ),
             cart=state["cart"],
-            pending_approval_id=str(pending_id) if pending_id else None,
+            pending_approval_id=str(pending_id),
         )
         return JSONResponse(response.model_dump())
 
@@ -138,12 +167,11 @@ async def _chat_streaming(payload: ChatRequest) -> StreamingResponse:
     async def event_generator():  # type: ignore[no-untyped-def]
         yield f"event: start\ndata: {json.dumps({'session_id': session_id, 'trace_id': str(trace_id)})}\n\n"
 
-        try:
-            result = await asyncio.wait_for(asyncio.shield(task), timeout=GATE_RACE_TIMEOUT_SECONDS)
-        except asyncio.TimeoutError:
-            pending_id = await _find_latest_pending_approval(trace_id)
+        result, pending_id = await _await_graph_result(task, trace_id)
+
+        if result is None:
             payload_out = {
-                "pending_approval_id": str(pending_id) if pending_id else None,
+                "pending_approval_id": str(pending_id),
                 "response": "Waiting for merchant confirmation on this action.",
             }
             yield f"event: pending_approval\ndata: {json.dumps(payload_out)}\n\n"

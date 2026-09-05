@@ -113,13 +113,17 @@ class RazorpayClient:
         idempotency_key: str,
     ) -> dict[str, Any]:
         self._simulator.maybe_raise("payment_links")
-        payload = {
+        payload: dict[str, Any] = {
             "amount": amount_paise,
             "currency": "INR",
             "description": description,
-            "customer": customer,
             "notify": {"sms": False, "email": bool(customer.get("email"))},
         }
+        # Razorpay's API rejects an empty/malformed `customer` object outright ("incorrect JSON
+        # object received - faulty key: customer") rather than treating it as "no customer info" —
+        # confirmed against the live test-mode API. Omit the key entirely when there's nothing real.
+        if customer:
+            payload["customer"] = customer
         return await self._call(
             lambda: self._client.payment_link.create(
                 payload, headers={"X-Razorpay-Idempotency": idempotency_key}

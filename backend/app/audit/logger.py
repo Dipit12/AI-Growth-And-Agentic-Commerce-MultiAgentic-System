@@ -47,7 +47,15 @@ class AuditLogger:
             self._drain_task = asyncio.create_task(self._drain_loop())
 
     async def stop(self) -> None:
+        """Drains whatever is still queued before cancelling the background task — a short-lived
+        script that does start()...log a few events...stop() would otherwise lose exactly the
+        events it just logged, since put_nowait() returns before the drain loop ever gets a chance
+        to run (confirmed: this silently dropped scripts/demo_hallucination.py's discovery events)."""
         if self._drain_task is not None:
+            try:
+                await asyncio.wait_for(self._queue.join(), timeout=5.0)
+            except TimeoutError:
+                logger.error("audit.stop_drain_timed_out", remaining=self._queue.qsize())
             self._drain_task.cancel()
             try:
                 await self._drain_task

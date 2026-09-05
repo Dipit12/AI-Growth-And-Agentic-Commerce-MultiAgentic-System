@@ -22,9 +22,12 @@ class Settings(BaseSettings):
     ANTHROPIC_API_KEY: str = ""
     VOYAGE_API_KEY: str = ""
 
-    # Local-model fallback per CLAUDE.md's tech stack ("local Llama via Ollama as fallback for
-    # cost-sensitive nodes"). When ANTHROPIC_API_KEY is unset, app/agents/llm.py uses Ollama instead
-    # of failing outright — set OLLAMA_MODEL to whatever's pulled locally (e.g. "deepseek-r1:1.5b").
+    # Fallback LLM chain when ANTHROPIC_API_KEY is unset (app/agents/llm.py): Groq first (fast
+    # hosted inference), then a local Ollama model. Groq's free tier and low latency make it a
+    # better fit than a small local model for a demo — set GROQ_API_KEY to use it.
+    GROQ_API_KEY: str = ""
+    GROQ_MODEL: str = "openai/gpt-oss-120b"
+
     OLLAMA_MODEL: str = ""
     OLLAMA_BASE_URL: str = "http://localhost:11434"
 

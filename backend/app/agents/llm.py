@@ -1,15 +1,17 @@
 """Thin wrapper around the chat model shared by agent nodes. Layer 2 (agents).
 
 Every node takes an injectable `llm_call` callable so tests can supply a fake without hitting the
-network or needing an API key; production code falls through to `default_llm_call`, which calls
-Claude Haiku via langchain-anthropic when ANTHROPIC_API_KEY is set, otherwise falls back to a local
+network or needing an API key; production code falls through to `default_llm_call`, which tries, in
+order: Claude Haiku via langchain-anthropic (ANTHROPIC_API_KEY), Groq's hosted inference
+(GROQ_API_KEY — fast, and the practical default when no Anthropic key is available), then a local
 Ollama model (OLLAMA_MODEL) per CLAUDE.md's tech stack ("local Llama via Ollama as fallback for
-cost-sensitive nodes").
+cost-sensitive nodes") as the last resort for a fully offline setup.
 """
 
 from collections.abc import Awaitable, Callable
 
 import httpx
+from groq import AsyncGroq
 from langchain_anthropic import ChatAnthropic
 
 from app.agents.state import ChatMessage
@@ -18,6 +20,7 @@ from app.config import get_settings
 LLMCallFn = Callable[[str], Awaitable[str]]
 
 _model_cache: ChatAnthropic | None = None
+_groq_client_cache: AsyncGroq | None = None
 
 OLLAMA_TIMEOUT_SECONDS = 120.0
 
@@ -48,6 +51,25 @@ async def _anthropic_llm_call(prompt: str) -> str:
     return str(content)
 
 
+def _get_groq_client() -> AsyncGroq:
+    global _groq_client_cache
+    if _groq_client_cache is None:
+        settings = get_settings()
+        _groq_client_cache = AsyncGroq(api_key=settings.GROQ_API_KEY)
+    return _groq_client_cache
+
+
+async def _groq_llm_call(prompt: str) -> str:
+    settings = get_settings()
+    client = _get_groq_client()
+    completion = await client.chat.completions.create(
+        messages=[{"role": "user", "content": prompt}],
+        model=settings.GROQ_MODEL,
+        temperature=0,
+    )
+    return (completion.choices[0].message.content or "").strip()
+
+
 async def _ollama_llm_call(prompt: str) -> str:
     settings = get_settings()
     async with httpx.AsyncClient(timeout=OLLAMA_TIMEOUT_SECONDS) as client:
@@ -66,10 +88,12 @@ async def default_llm_call(prompt: str) -> str:
     settings = get_settings()
     if settings.ANTHROPIC_API_KEY:
         return await _anthropic_llm_call(prompt)
+    if settings.GROQ_API_KEY:
+        return await _groq_llm_call(prompt)
     if settings.OLLAMA_MODEL:
         return await _ollama_llm_call(prompt)
     raise RuntimeError(
-        "No LLM configured: set ANTHROPIC_API_KEY or OLLAMA_MODEL in the environment/.env."
+        "No LLM configured: set ANTHROPIC_API_KEY, GROQ_API_KEY, or OLLAMA_MODEL in the environment/.env."
     )
 
 
